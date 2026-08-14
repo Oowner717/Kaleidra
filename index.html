@@ -91,10 +91,11 @@ const CONFIG = {
     // 0.30/s == 9% per 300ms, inside the 10%-per-300ms ceiling.
     lumRatePerSec:      0.30,
     bloomRatePerSec:    0.30,
-    // The trail-fill alpha also sets exposure (see CONFIG.exposure), so it is
-    // limited in absolute terms tightly enough that its RELATIVE rate stays
-    // under the ceiling too: 0.006/s against a 0.032 floor is <6% per 300ms.
-    bgRatePerSec:       0.006,
+    // The trail-fill alpha also sets exposure (see CONFIG.exposure), so what
+    // matters is its RELATIVE rate, not its absolute one. Limiting the ratio
+    // directly keeps it at 9% per 300ms at any magnitude, and lets the trail
+    // curve keep up with a one-minute cycle instead of lagging it.
+    bgRelRatePerSec:    0.30,
     widthRatePerSec:    0.55,   // stroke scale also reads as brightness
     // The cold-start fade-in is this same limiter running from 0 -> 1,
     // so start-up cannot outrun the rate ceiling either.
@@ -105,8 +106,10 @@ const CONFIG = {
 
   /* ---- the arc: sole primary driver of the composition ---------------- */
   arc: {
-    cycleMinSec: 180,
-    cycleMaxSec: 300,
+    // Fast mode: a whole cycle now runs in about a minute, so the arc is
+    // something you watch happen rather than something you notice in hindsight.
+    cycleMinSec: 55,
+    cycleMaxSec: 95,
     // phase weights, in order REST GATHER BLOOM DISSOLVE SETTLE
     weights: [0.15, 0.30, 0.15, 0.25, 0.15],
     names:   ['REST', 'GATHER', 'BLOOM', 'DISSOLVE', 'SETTLE'],
@@ -155,8 +158,8 @@ const CONFIG = {
   /* ---- symmetry ------------------------------------------------------- */
   symmetry: {
     minFold: 5, maxFold: 12,
-    crossfadeSec: 26,        // fold changes cross-fade this long
-    midCycleChance: 0.5,     // chance of a second fold change during DISSOLVE
+    crossfadeSec: 9,         // fold changes cross-fade this long
+    midCycleChance: 0.85,    // chance of a second fold change during DISSOLVE
     midCycleAt: 0.70,        // cycle progress at which it may happen
   },
 
@@ -164,7 +167,7 @@ const CONFIG = {
   flow: {
     grid: 24,             // cells across the field box
     noiseScale: 2.05,     // noise periods across the field box
-    evolveRate: 0.021,    // noise z-drift, per second, at tempo 1
+    evolveRate: 0.055,    // noise z-drift, per second, at tempo 1
     speedPx: 0.055,       // node speed as a fraction of field radius / second
     inertiaSec: 0.55,     // velocity time constant -- keeps motion laminar
     octaveGain: 0.34,
@@ -185,7 +188,7 @@ const CONFIG = {
     dotFrac: 0.050,       // role 0: bold points  (the "few bold primaries")
     structFrac: 0.170,    // role 1: secondary lattice
     churnPerFrame: 5,     // node count changes per frame (invisible zone only)
-    fadeInSec: 1.30,      // a new node's links arrive through the faint buckets
+    fadeInSec: 0.60,      // a new node's links arrive through the faint buckets
     recyclePerSec: 2.5,   // invisible re-seeding, fights any slow density drift
   },
 
@@ -212,7 +215,7 @@ const CONFIG = {
     // at high fold counts the copies already carry the intricacy, and draw
     // calls are the one cost that scales with N.
     mergeBucketsAtStamps: 20,
-    budgetRatePerSec: 110,             // how fast the link budget may move
+    budgetRatePerSec: 420,             // how fast the link budget may move
   },
 
   /* ---- exposure -------------------------------------------------------
@@ -254,7 +257,7 @@ const CONFIG = {
     harmonics: [1, 2, 3],
     arcSteps: 13,          // polyline steps per wedge for harmonic rings
     families: ['radial', 'spiral', 'polygonal', 'woven'],
-    crossfadeSec: 13,
+    crossfadeSec: 5,
     // The harmonic paths are rebuilt every N frames, not every frame. Their
     // radii breathe at ~0.0014/sec, so a 4-frame step is ~0.0001 of relative
     // change -- invisible -- while rotation, scale and breathing keep coming
@@ -269,7 +272,7 @@ const CONFIG = {
   palette: {
     minStrokeL: 70,        // CIE L* floor for every stroke colour
     maxBgL: 11,            // CIE L* ceiling for the background
-    hueDriftPeriodSec: 660,// slower than the arc, always
+    hueDriftPeriodSec: 210,// still slower than a cycle
     // Two hue families held apart, after Islamic tilework: a cool ground of
     // lapis and turquoise carrying the lattice, warm gold and amber carrying
     // the geometric armature. Both are on screen at once, which is what reads
@@ -291,15 +294,15 @@ const CONFIG = {
     bgL: [0.168, 0.072],   // OKLCH L, centre -> edge (verified against maxBgL)
     bgChroma: 0.032,
     rerollHueDeg: [40, 150],
-    hueEaseSec: 34,
+    hueEaseSec: 12,
   },
 
   /* ---- trance mechanics ----------------------------------------------- */
   trance: {
-    rotDegPerSecMax: 0.50,
-    rotShape: 0.70,          // <1 keeps |speed| mostly inside 0.2-0.5 deg/s
-    rotPeriodSec: 312,       // full reverse-and-return
-    breathHz: 0.137,         // human breath rate
+    rotDegPerSecMax: 1.40,
+    rotShape: 0.70,          // <1 keeps |speed| in the upper part of its range
+    rotPeriodSec: 150,       // full reverse-and-return
+    breathHz: 0.195,         // still inside the 0.1-0.2Hz breath band
     breathLum: 0.075,
     breathScale: 0.026,
     anchorRFrac: 0.032,      // stable centre anchor, in Rc units
@@ -344,8 +347,8 @@ const CONFIG = {
   /* ---- ink: restraint, measured ---------------------------------------- */
   ink: {
     hardCap: 0.20,         // never exceeded, whatever the arc asks for
-    shedRatePerSec: 0.75,  // how fast density backs off when over budget
-    recoverRatePerSec: 0.10,
+    shedRatePerSec: 1.60,  // how fast density backs off when over budget
+    recoverRatePerSec: 0.32,
     scaleMin: 0.22,
     visSamples: 96,        // resolution of the on-screen-visibility table
   },
@@ -361,46 +364,46 @@ const CONFIG = {
     // a wake, however brief the contact.
     tapImpulse: 0.38,
     radiusFrac: 0.115,      // of the minor viewport dimension
-    swirl: 0.75,            // divergence-free component (dominant)
+    swirl: 1.05,            // divergence-free component (dominant)
     radial: 0.22,           // weak attract/repel
-    dragGain: 0.55,
+    dragGain: 0.85,
     dragMaxPxPerSec: 900,
-    detailGain: 1.62,       // local link-radius bloom under the finger
+    detailGain: 2.00,       // local link-radius bloom under the finger
     glowAlpha: 0.028,
     // --- wake: a drag deposits decaying vorticity ALONG its path, so the
     //     whole stroke keeps stirring after the finger has gone, not just the
     //     point it ended at.
-    wakeCount: 20,
+    wakeCount: 28,
     wakeSpacing: 0.42,      // deposit spacing, in touch-radius units
-    wakeLifeSec: 7.5,
+    wakeLifeSec: 5.0,
     wakeRadius: 0.5,        // of the touch radius
     wakeSwirl: 0.62, wakeDrag: 0.5,
     // --- dwell: holding still crystallises the lattice locally, drawing
     //     nearby nodes onto the harmonic ring radii. Stillness is rewarded.
     dwellMoveTol: 2.4,      // CSS px/frame counted as "still"
-    dwellOnsetSec: 0.9, dwellFullSec: 3.2,
-    dwellSnap: 1.35,        // radial pull toward the nearest ring
+    dwellOnsetSec: 0.5, dwellFullSec: 1.8,
+    dwellSnap: 2.10,        // radial pull toward the nearest ring
     // --- two fingers: pinch breathes the composition, twist leans the
     //     rotation. Both are hard-bounded and decay back on their own, so the
     //     pattern is never actually under the user's control.
-    pinchGain: 0.55, pinchMax: 0.07,
-    twistGain: 0.30, twistMax: 0.0045,   // radians/sec (~0.26 deg/s)
-    gestureDecaySec: 5.0,
+    pinchGain: 0.80, pinchMax: 0.11,
+    twistGain: 0.55, twistMax: 0.0120,   // radians/sec (~0.69 deg/s)
+    gestureDecaySec: 2.5,
     // Gestures are rate-limited on the way in as well as bounded. Scale is a
     // large-area luminance change (the same ink spread over more screen), so a
     // fast pinch would otherwise breach the 10%-per-300ms ceiling; 0.12/s caps
     // it at ~3.6% per 300ms. Rotation is slewed so motion never steps either.
-    pinchRatePerSec: 0.12,
-    twistRatePerSec: 0.008,
+    pinchRatePerSec: 0.22,
+    twistRatePerSec: 0.030,
     // --- pattern bias: touch slowly shapes the MATERIAL, not just its motion.
     //     Each accumulator is hard-bounded to +-1, decays back on its own, and
     //     is applied through a slow slew so nothing ever steps. The two that
     //     change discrete material -- fold count and geometry family -- are
     //     only consulted at a natural re-roll, minutes later, so the pattern
     //     never changes under the finger; it changes because of the finger.
-    biasRatePerSec: 0.30,     // how fast contact accumulates bias
-    biasDecaySec: 95,         // and how slowly it lets go
-    biasSlewPerSec: 0.055,    // applied value, so material never steps
+    biasRatePerSec: 0.80,     // how fast contact accumulates bias
+    biasDecaySec: 30,         // and how slowly it lets go
+    biasSlewPerSec: 0.22,     // applied value, so material never steps
     biasCycleKeep: 0.30,      // carried past a cycle boundary (new material)
     harmonicDepth: 0.60,      // petal depth, and a 2nd harmonic on top
     ringSpread: 0.32,         // spreads or compresses the ring radii
@@ -410,9 +413,27 @@ const CONFIG = {
     // weights the dice; it must never pick the face.
     foldWeight: 0.34,         // tilts the NEXT fold re-roll, never forces it
     familyWeight: 0.60,       // tilts the NEXT geometry family the same way
-    arcNudgeMaxFrac: 0.10,  // at most +-10% of a cycle, per cycle
-    arcNudgeRate: 0.26,     // clock runs at most 26% faster while touched
-    arcNudgeSmoothSec: 2.4, // rapid tapping cannot chain blooms
+    // --- flick: releasing at speed throws a shockwave from where you let go
+    flickMinSpeed: 9,         // smoothed px/frame
+    flickAmp: [0.5, 1.35],
+    // --- tap: seeds a burst of new lattice under the finger, at every one of
+    //     its symmetric images, which then disperses into the flow
+    burstCount: 14,
+    burstSpread: 0.55,        // of the touch radius
+    burstGapSec: 0.30,
+    burstMaxLoad: 0.92,       // never fill the node pool past this
+    // --- stir: fast dragging surges the whole field's tempo, then it settles
+    surgeGain: 0.85,
+    surgeDecaySec: 2.8,
+    surgeRef: 24,             // px/frame that counts as a full surge
+    // --- three fingers held: asks for a new symmetry, right now. It still
+    //     cross-fades over crossfadeSec, so it arrives without a step.
+    multiFoldFingers: 3,
+    multiFoldSec: 0.7,
+    multiFoldGapSec: 5.0,
+    arcNudgeMaxFrac: 0.18,  // at most +-18% of a cycle, per cycle
+    arcNudgeRate: 0.55,     // clock runs at most 55% faster while touched
+    arcNudgeSmoothSec: 1.2, // rapid tapping still cannot chain blooms
   },
 
   /* ---- performance ----------------------------------------------------- */
@@ -434,14 +455,14 @@ const CONFIG = {
      ------------------------------------------------------------------- */
   pulse: {
     slots: 3,
-    travelSec: 26,
-    riseSec: 1.2,
+    travelSec: 13,
+    riseSec: 0.7,
     width: 0.13,           // half-width, in field-radius units
     gain: 0.40,            // peak lift inside the band
     fadeFrom: 0.55, fadeTo: 1.05,
-    spontaneousSec: [30, 68],
+    spontaneousSec: [7, 18],
     touchAmp: 0.72,
-    touchMinGapSec: 6,     // so tapping cannot chain pulses
+    touchMinGapSec: 1.2,   // responsive, still bounded
     maxSum: 1.2,
     focusYield: 0.6,       // the static focal band steps back for a passing
                            // pulse: still one focal event at a time
@@ -1134,7 +1155,7 @@ function recycleNodes(dt) {
 
 function updateNodes(dt) {
   const inertia = 1 - Math.exp(-dt / CONFIG.flow.inertiaSec);
-  const tempo = arc.v.tempo;
+  const tempo = tempoNow;
   const twoB = 2 * B;
   const wellsOn = wellCount > 0 || wakeLive > 0;
   const T = CONFIG.touch;
@@ -1783,6 +1804,8 @@ const WAKE = [];
 for (let i = 0; i < CONFIG.touch.wakeCount; i++) WAKE.push({ fx: 0, fy: 0, vx: 0, vy: 0, s: 0 });
 let wakeCursor = 0, wakeLive = 0;
 let tfDist = -1, tfAng = 0;
+let tempoSurge = 0, tempoNow = 1;
+let burstGap = 9, multiHold = 0, foldGestureGap = 9, burstCursor = 0;
 let touchScaleWant = 0, touchRotWant = 0;   // gesture accumulators
 let touchScaleBias = 0, touchRotBias = 0;   // rate-limited values actually applied
 const RINGR = new Float32Array(8);
@@ -1804,6 +1827,31 @@ function foldScreen(sx, sy, wl) {
   if (t > half) { t = seg - t; m = -1; k = k + 1; }
   wl.fx = r * Math.cos(t); wl.fy = r * Math.sin(t);
   wl.fk = k % n; wl.fm = m;
+}
+
+/* A tap seeds new nodes at the finger's own pre-image in source space, so the
+   burst appears under the finger AND at all 2N of its symmetric images. They
+   arrive through the faint link buckets and then disperse into the flow. */
+function burstNodes(wl) {
+  const T = CONFIG.touch;
+  if (nActive > MAXN * T.burstMaxLoad) return;
+  const n = (sym.x > 0.5 ? sym.nxt : sym.cur);
+  const ang = wl.fk * (TAU / n), ca = Math.cos(ang), sa = Math.sin(ang);
+  const fy = wl.fy * wl.fm;
+  const sx = ca * wl.fx - sa * fy, sy = sa * wl.fx + ca * fy;
+  const spread = touchRF * T.burstSpread;
+  let placed = 0;
+  for (let k = 0; k < MAXN && placed < T.burstCount; k++) {
+    const i = burstCursor; burstCursor = (burstCursor + 1) % MAXN;
+    if (nRole[i] !== 2) continue;                            // tertiary only
+    if (nAct[i] && visFrac(nrad[i] * SC) > 0) continue;      // never yank a visible node
+    const x = sx + rr(-spread, spread), y = sy + rr(-spread, spread);
+    nx[i] = x; ny[i] = y; nvx[i] = 0; nvy[i] = 0;
+    nrad[i] = Math.sqrt(x * x + y * y);
+    if (!nAct[i]) setNodeActive(i, true);
+    nAge[i] = 0;
+    placed++;
+  }
 }
 
 function findWell(id) {
@@ -1829,6 +1877,7 @@ function onDown(e) {
     pulseGap = 0;
     launchPulse(Math.hypot(wl.fx, wl.fy) * SC / Math.max(1, Rfield), CONFIG.pulse.touchAmp);
   }
+  if (burstGap >= CONFIG.touch.burstGapSec) { burstGap = 0; burstNodes(wl); }
 }
 
 function onMove(e) {
@@ -1841,6 +1890,13 @@ function onMove(e) {
 function onUp(e) {
   const wl = findWell(e.pointerId);
   if (!wl) return;
+  const T = CONFIG.touch;
+  if (wl.moved > T.flickMinSpeed) {
+    const k = clamp((wl.moved - T.flickMinSpeed) / (T.surgeRef * 1.6), 0, 1);
+    launchPulse(Math.hypot(wl.fx, wl.fy) * SC / Math.max(1, Rfield),
+                lerp(T.flickAmp[0], T.flickAmp[1], k));
+    pulseGap = 0;
+  }
   wl.id = -1; wl.held = false;   // strength keeps decaying: a wake, not a stop
   // If the contact was shorter than a frame, let the well finish arriving
   // before it starts leaving -- otherwise a quick tap would do nothing at all.
@@ -1967,6 +2023,15 @@ function updateWells(dt) {
     wakeLive++;
   }
 
+  // ---- stirring surges the field's tempo, then it settles back
+  let fastest = 0;
+  for (let i = 0; i < WELLS.length; i++) if (WELLS[i].held) fastest = Math.max(fastest, WELLS[i].moved);
+  tempoSurge = Math.max(tempoSurge * Math.exp(-dt / T.surgeDecaySec),
+                        clamp(fastest / T.surgeRef, 0, 1));
+
+  burstGap += dt;
+  foldGestureGap += dt;
+
   // ---- two fingers: pinch breathes, twist leans. Bounded and self-cancelling.
   let h0 = -1, h1 = -1, hn = 0;
   for (let i = 0; i < WELLS.length; i++) if (WELLS[i].held) { if (hn === 0) h0 = i; else if (hn === 1) h1 = i; hn++; }
@@ -1982,6 +2047,14 @@ function updateWells(dt) {
     }
     tfDist = d; tfAng = a;
   } else tfDist = -1;
+
+  // ---- three fingers held: ask for a new symmetry. It still cross-fades.
+  if (hn >= T.multiFoldFingers) multiHold += dt; else multiHold = 0;
+  if (multiHold >= T.multiFoldSec && foldGestureGap >= T.multiFoldGapSec) {
+    multiHold = 0; foldGestureGap = 0;
+    setFold(pickFold());
+    if (pulseGap >= CONFIG.pulse.touchMinGapSec) { pulseGap = 0; launchPulse(0.06, 1); }
+  }
   const gDecay = Math.exp(-dt / T.gestureDecaySec);
   touchScaleWant *= gDecay;
   touchRotWant *= gDecay;
@@ -2068,6 +2141,7 @@ function updateDebug(dt) {
     '\nphase  ' + CONFIG.arc.names[arc.phase] + '  ' + (arc.phaseProg * 100).toFixed(0) + '%' +
     '\ncycle  ' + (arc.p * 100).toFixed(1) + '%  of ' + arc.len.toFixed(0) + 's  #' + arc.cycle +
     '\nfold   ' + fold +
+    '\nsurge  ' + tempoSurge.toFixed(2) + '  tempo ' + tempoNow.toFixed(2) +
     '\npulse  ' + PULSE.filter(q => q.live).length + '  sum ' + pulseSum.toFixed(2) +
     '\nbias   h' + bias.harmonic.toFixed(2) + ' r' + bias.ringR.toFixed(2) +
       ' c' + bias.hue.toFixed(2) + ' N' + bias.fold.toFixed(2) + ' f' + bias.family.toFixed(2) +
@@ -2285,13 +2359,17 @@ function frame(now) {
   lumGlobal = slew(lumGlobal, clamp(lumTarget, 0, 1.35), CONFIG.safety.lumRatePerSec, dt);
   bloomAlpha = slew(bloomAlpha, CONFIG.bloom.alphaBase * arc.v.bloom * lumGlobal * bloomQ,
                     CONFIG.safety.bloomRatePerSec, dt);
-  bgAlpha = slew(bgAlpha, arc.v.trail, CONFIG.safety.bgRatePerSec, dt);
+  {
+    const m = 1 + CONFIG.safety.bgRelRatePerSec * dt;
+    bgAlpha = clamp(arc.v.trail, bgAlpha / m, bgAlpha * m);
+  }
   expo = bgAlpha / CONFIG.exposure.trailRef;
 
   densityTotal = clamp(arc.v.density * quality * inkScale, 0.05, 1.15);
 
   updateRings();
-  updateFlow(dt, arc.v.tempo);
+  tempoNow = arc.v.tempo * (1 + CONFIG.touch.surgeGain * tempoSurge);
+  updateFlow(dt, tempoNow);
   churnNodes();
   recycleNodes(dt);
   updateNodes(dt);
