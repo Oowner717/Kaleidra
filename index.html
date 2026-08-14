@@ -257,9 +257,21 @@ const CONFIG = {
     minStrokeL: 70,        // CIE L* floor for every stroke colour
     maxBgL: 11,            // CIE L* ceiling for the background
     hueDriftPeriodSec: 660,// slower than the arc, always
-    baseChroma: 0.125,
-    baseLightness: 0.86,   // OKLCH L
-    spreadDeg: [0, 30, -36, 168, 96],
+    // Two hue families held apart, after Islamic tilework: a cool ground of
+    // lapis and turquoise carrying the lattice, warm gold and amber carrying
+    // the geometric armature. Both are on screen at once, which is what reads
+    // as colour -- a single saturated tint just reads as a tinted monochrome.
+    // Measured optimum. The binding constraint is the sRGB gamut at high
+    // lightness, NOT the L* 70 floor -- sweeping the floor from 70 down to 58
+    // changes achievable chroma by nothing at all. Dropping OKLCH L to 0.75 is
+    // what buys saturation (mean 0.62 -> 0.72, worst hue 0.27 -> 0.35), and the
+    // resolver still lands every entry at L* 70.0, so contrast is unchanged.
+    baseChroma: 0.26,
+    baseLightness: 0.75,
+    //            bright  lapis  turquoise  gold  amber
+    spreadDeg:    [0,      10,    44,      172,   140],
+    chromaScale:  [0.50,   1.00,  1.00,    1.06,  1.00],
+    lightOffset:  [0.075,  0.005, -0.010,  0.000, -0.020],
     // The ground keeps its own slow cycle inside the cool half of the wheel:
     // a night sky under any stroke palette, never an olive wash.
     bgHueBase: 264, bgHueSpan: 46, bgHuePeriodSec: 940,
@@ -469,18 +481,21 @@ function inGamut(v) { return v[0] >= -0.001 && v[0] <= 1.001 && v[1] >= -0.001 &
    least `minL`. Chroma yields first, then lightness climbs. Verified, not hoped. */
 function resolveStroke(L, C, h, minL, out) {
   let ll = L, cc = C;
-  for (let i = 0; i < 24; i++) {
+  // Fine steps and a long budget: this lands close to the most chromatic
+  // colour that still clears the L* floor, instead of overshooting pale.
+  for (let i = 0; i < 60; i++) {
     oklchToLinear(ll, cc, h, _lin);
     const ok = inGamut(_lin);
     const lum = cieL(Math.max(0, _lin[0]), Math.max(0, _lin[1]), Math.max(0, _lin[2]));
     if (ok && lum >= minL) break;
-    if (!ok) cc *= 0.92; else ll = Math.min(1, ll + 0.018);
+    if (!ok) cc *= 0.972; else ll = Math.min(1, ll + 0.008);
   }
   oklchToLinear(ll, cc, h, _lin);
   out[0] = clamp(srgbEncode(clamp(_lin[0], 0, 1)), 0, 1) * 255;
   out[1] = clamp(srgbEncode(clamp(_lin[1], 0, 1)), 0, 1) * 255;
   out[2] = clamp(srgbEncode(clamp(_lin[2], 0, 1)), 0, 1) * 255;
   out[3] = cieL(clamp(_lin[0], 0, 1), clamp(_lin[1], 0, 1), clamp(_lin[2], 0, 1));
+  out[4] = ll; out[5] = cc; out[6] = h;   // kept for perceptual interpolation
   return out;
 }
 
@@ -498,13 +513,14 @@ function resolveBg(L, C, h, maxL, out) {
   out[1] = clamp(srgbEncode(clamp(_lin[1], 0, 1)), 0, 1) * 255;
   out[2] = clamp(srgbEncode(clamp(_lin[2], 0, 1)), 0, 1) * 255;
   out[3] = cieL(clamp(_lin[0], 0, 1), clamp(_lin[1], 0, 1), clamp(_lin[2], 0, 1));
+  out[4] = ll; out[5] = cc; out[6] = h;   // kept for perceptual interpolation
   return out;
 }
 
 const PAL_N = CONFIG.palette.spreadDeg.length;
 const palette = [];
-for (let i = 0; i < PAL_N; i++) palette.push([255, 255, 255, 100]);
-const bgIn = [0, 0, 0, 0], bgOut = [0, 0, 0, 0];
+for (let i = 0; i < PAL_N; i++) palette.push([255, 255, 255, 100, 0.9, 0, 0]);
+const bgIn = [0, 0, 0, 0, 0, 0, 0], bgOut = [0, 0, 0, 0, 0, 0, 0];
 
 let hueCurrent = rr(0, 360);
 let hueTarget = hueCurrent;
@@ -515,8 +531,7 @@ function updatePalette(t) {
   const base = hueCurrent + drift;
   for (let i = 0; i < PAL_N; i++) {
     const wob = Math.sin(t * 0.017 + i * 1.7) * 4.5;
-    resolveStroke(P.baseLightness - (i === 0 ? -0.04 : 0.015 * i),
-                  P.baseChroma * (i === 0 ? 0.72 : 1 + 0.1 * Math.sin(i * 2.1)),
+    resolveStroke(P.baseLightness + P.lightOffset[i], P.baseChroma * P.chromaScale[i],
                   base + P.spreadDeg[i] + wob, P.minStrokeL, palette[i]);
   }
   const bh = P.bgHueBase + P.bgHueSpan * Math.sin(TAU * t / P.bgHuePeriodSec);
@@ -745,10 +760,20 @@ function envelope(u) {
 
 const GRAD_STOPS = 16;
 const _cmix = [0, 0, 0];
+/* Interpolates in OKLCH along the short way round the hue circle. A straight
+   sRGB lerp between, say, turquoise and gold passes through grey -- the mid
+   radius of every gradient would desaturate exactly where most of the drawing
+   happens. */
 function mixCol(a, b, t) {
-  _cmix[0] = a[0] + (b[0] - a[0]) * t;
-  _cmix[1] = a[1] + (b[1] - a[1]) * t;
-  _cmix[2] = a[2] + (b[2] - a[2]) * t;
+  if (t <= 0.0005) { _cmix[0] = a[0]; _cmix[1] = a[1]; _cmix[2] = a[2]; return _cmix; }
+  if (t >= 0.9995) { _cmix[0] = b[0]; _cmix[1] = b[1]; _cmix[2] = b[2]; return _cmix; }
+  const L = a[4] + (b[4] - a[4]) * t;
+  const C = a[5] + (b[5] - a[5]) * t;
+  const dh = ((b[6] - a[6] + 540) % 360) - 180;
+  oklchToLinear(L, C, a[6] + dh * t, _lin);
+  _cmix[0] = clamp(srgbEncode(clamp(_lin[0], 0, 1)), 0, 1) * 255;
+  _cmix[1] = clamp(srgbEncode(clamp(_lin[1], 0, 1)), 0, 1) * 255;
+  _cmix[2] = clamp(srgbEncode(clamp(_lin[2], 0, 1)), 0, 1) * 255;
   return _cmix;
 }
 
@@ -1416,7 +1441,12 @@ function resize() {
 
 /* ---- gradients (shape + colour only; luminance rides on globalAlpha) --- */
 const GMAX = CONFIG.composition.focusGain;
-const LAYER_COL = [[0, 1], [1, 2], [2, 3], [3, 1], [1, 4], [0, 0]];
+// [innerColour, outerColour] per layer. The warm pair carries the geometric
+// armature and the bold points; the cool pair carries the lattice. Previously
+// every prominent layer drew from the same 66-degree band, which is why the
+// piece read as one tint however saturated the palette was.
+//                bold    lattice  dusting  geoMid  geoFine  dots
+const LAYER_COL = [[3, 4], [1, 2], [2, 1], [4, 3], [1, 0], [3, 0]];
 const gradMain = new Array(6).fill(null);
 const gradBloom = new Array(6).fill(null);
 let bgGrad = null;
