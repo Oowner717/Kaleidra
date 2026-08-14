@@ -319,6 +319,11 @@ const CONFIG = {
     maxPointers: 5,
     riseMs: 300,
     decayMinSec: 4, decayMaxSec: 8,
+    // A tap can be released before the first frame tick, so its well would
+    // otherwise die at zero strength and do nothing. Every touch arrives at
+    // least this far before it starts leaving: lifting a finger always leaves
+    // a wake, however brief the contact.
+    tapImpulse: 0.38,
     radiusFrac: 0.115,      // of the minor viewport dimension
     swirl: 0.75,            // divergence-free component (dominant)
     radial: 0.22,           // weak attract/repel
@@ -1506,7 +1511,7 @@ function bloomPass() {
 const WELLS = [];
 for (let i = 0; i < CONFIG.touch.maxPointers; i++) {
   WELLS.push({ id: -1, held: false, sx: 0, sy: 0, psx: 0, psy: 0,
-               fx: 0, fy: 0, fk: 0, fm: 1, r2: 1, s: 0,
+               fx: 0, fy: 0, fk: 0, fm: 1, r2: 1, s: 0, pending: 0,
                vx: 0, vy: 0, spin: 1, pull: 1, force: 1, decay: 6 });
 }
 let wellCount = 0;
@@ -1540,7 +1545,7 @@ function onDown(e) {
   for (let i = 0; i < WELLS.length; i++) if (WELLS[i].id < 0 && WELLS[i].s <= 0.02) { wl = WELLS[i]; break; }
   if (!wl) for (let i = 0; i < WELLS.length; i++) if (WELLS[i].id < 0) { wl = WELLS[i]; break; }
   if (!wl) return;
-  wl.id = e.pointerId; wl.held = true;
+  wl.id = e.pointerId; wl.held = true; wl.pending = 0;
   wl.sx = wl.psx = e.clientX; wl.sy = wl.psy = e.clientY;
   wl.vx = wl.vy = 0;
   wl.spin = rnd() < 0.5 ? 1 : -1;
@@ -1560,6 +1565,9 @@ function onUp(e) {
   const wl = findWell(e.pointerId);
   if (!wl) return;
   wl.id = -1; wl.held = false;   // strength keeps decaying: a wake, not a stop
+  // If the contact was shorter than a frame, let the well finish arriving
+  // before it starts leaving -- otherwise a quick tap would do nothing at all.
+  wl.pending = wl.s < CONFIG.touch.tapImpulse ? CONFIG.touch.tapImpulse : 0;
 }
 
 function updateWells(dt) {
@@ -1594,9 +1602,14 @@ function updateWells(dt) {
       } else {
         wl.vx *= relaxTC; wl.vy *= relaxTC;
       }
-    } else if (wl.s > 0) {
-      wl.s *= Math.exp(-dt * 3 / wl.decay);
-      if (wl.s < 0.002) wl.s = 0;
+    } else if (wl.s > 0 || wl.pending > 0) {
+      if (wl.pending > 0) {
+        wl.s = Math.min(wl.pending, wl.s + rise);
+        if (wl.s >= wl.pending - 1e-4) wl.pending = 0;
+      } else {
+        wl.s *= Math.exp(-dt * 3 / wl.decay);
+        if (wl.s < 0.002) wl.s = 0;
+      }
       wl.vx *= relaxTC; wl.vy *= relaxTC;
     }
     wl.r2 = touchRF * touchRF;
