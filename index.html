@@ -383,6 +383,24 @@ const CONFIG = {
     // it at ~3.6% per 300ms. Rotation is slewed so motion never steps either.
     pinchRatePerSec: 0.12,
     twistRatePerSec: 0.008,
+    // --- pattern bias: touch slowly shapes the MATERIAL, not just its motion.
+    //     Each accumulator is hard-bounded to +-1, decays back on its own, and
+    //     is applied through a slow slew so nothing ever steps. The two that
+    //     change discrete material -- fold count and geometry family -- are
+    //     only consulted at a natural re-roll, minutes later, so the pattern
+    //     never changes under the finger; it changes because of the finger.
+    biasRatePerSec: 0.30,     // how fast contact accumulates bias
+    biasDecaySec: 95,         // and how slowly it lets go
+    biasSlewPerSec: 0.055,    // applied value, so material never steps
+    biasCycleKeep: 0.30,      // carried past a cycle boundary (new material)
+    harmonicDepth: 0.60,      // petal depth, and a 2nd harmonic on top
+    ringSpread: 0.32,         // spreads or compresses the ring radii
+    hueDeg: 24,               // palette hue offset at full bias
+    // Both tilts are kept BELOW one bucket of their draw, so even at full bias
+    // every fold count and every geometry family stays reachable. The finger
+    // weights the dice; it must never pick the face.
+    foldWeight: 0.34,         // tilts the NEXT fold re-roll, never forces it
+    familyWeight: 0.60,       // tilts the NEXT geometry family the same way
     arcNudgeMaxFrac: 0.10,  // at most +-10% of a cycle, per cycle
     arcNudgeRate: 0.26,     // clock runs at most 26% faster while touched
     arcNudgeSmoothSec: 2.4, // rapid tapping cannot chain blooms
@@ -437,6 +455,13 @@ const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const lerp = (a, b, t) => a + (b - a) * t;
 const smoothstep = (t) => (t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t));
 const smootherstep = (t) => (t <= 0 ? 0 : t >= 1 ? 1 : t * t * t * (t * (t * 6 - 15) + 10));
+
+/* Touch's influence on the generated MATERIAL. Declared here, above the arc,
+   because rollMotif() consults it and runs during module evaluation. */
+/* `want` accumulates from contact and decays; `bias` is the rate-limited value
+   the piece actually draws with, so material shifts are always gradual. */
+const biasWant = { harmonic: 0, ringR: 0, hue: 0, fold: 0, family: 0 };
+const bias = { harmonic: 0, ringR: 0, hue: 0, fold: 0, family: 0 };
 
 /* Rate-limited approach: the single choke point for anything that can move
    large-area luminance. Nothing bypasses this. */
@@ -563,7 +588,8 @@ for (let i = 0; i < PAL_N; i++) palette.push([255, 255, 255, 100, 0.9, 0, 0]);
 const bgIn = [0, 0, 0, 0, 0, 0, 0], bgOut = [0, 0, 0, 0, 0, 0, 0];
 
 let hueCurrent = rr(0, 360);
-let hueTarget = hueCurrent;
+let hueRoll = hueCurrent;      // this cycle's rolled target
+let hueTarget = hueCurrent;    // that, plus whatever the finger has asked for
 
 function updatePalette(t) {
   const P = CONFIG.palette;
@@ -638,9 +664,15 @@ const arc = { t: 0, len: 0, p: 0, phase: 0, phaseProg: 0, cycle: 0, v: {} };
 function rollMotif(avoidFamily) {
   const G = CONFIG.geometry;
   const rings = ri(G.ringsMin, G.ringsMax);
-  // never the same geometry family twice running: new material every cycle
-  let fam = Math.floor(rnd() * G.families.length);
-  for (let i = 0; i < 8 && fam === avoidFamily; i++) fam = Math.floor(rnd() * G.families.length);
+  // Never the same family twice running. The draw is ordered calm -> restless
+  // and tilted by how restlessly the piece has been handled, so stirring tends
+  // to bring on spirals and weaves, and stillness radial and polygonal work.
+  const ORDER = [0, 2, 3, 1];
+  const tiltF = bias.family * CONFIG.touch.familyWeight * 0.35;
+  let fam = ORDER[Math.floor(clamp(rnd() + tiltF, 0, 0.9999) * ORDER.length)];
+  for (let i = 0; i < 10 && fam === avoidFamily; i++) {
+    fam = ORDER[Math.floor(clamp(rnd() + tiltF, 0, 0.9999) * ORDER.length)];
+  }
   const m = {
     family: fam,
     rings: rings, ringR: [], ringE: [], ringH: [],
@@ -677,15 +709,22 @@ function newCycle(first) {
   if (!first) {
     motifB = rollMotif(motifA.family);
     motifBlend = 0;
-    hueTarget = hueCurrent + rr(CONFIG.palette.rerollHueDeg[0], CONFIG.palette.rerollHueDeg[1]) * (rnd() < 0.5 ? 1 : -1);
+    hueRoll = hueCurrent + rr(CONFIG.palette.rerollHueDeg[0], CONFIG.palette.rerollHueDeg[1]) * (rnd() < 0.5 ? 1 : -1);
+    for (const k in biasWant) biasWant[k] *= CONFIG.touch.biasCycleKeep;
     setFold(pickFold());
   }
 }
 
+/* Touch tilts the draw toward more or fewer folds. It shifts the quantile, so
+   every fold stays reachable -- the finger weights the dice, it does not pick. */
 function pickFold() {
-  const S = CONFIG.symmetry;
+  const S = CONFIG.symmetry, span = S.maxFold - S.minFold + 1;
+  const tilt = bias.fold * CONFIG.touch.foldWeight * 0.35;
   let n = sym.nxt;
-  for (let i = 0; i < 8 && n === sym.nxt; i++) n = ri(S.minFold, S.maxFold);
+  for (let i = 0; i < 10 && n === sym.nxt; i++) {
+    const u = clamp(rnd() + tilt, 0, 0.9999);
+    n = S.minFold + Math.floor(u * span);
+  }
   return n;
 }
 
@@ -717,7 +756,9 @@ function updateArc(dt, t) {
     midFoldDone = true;
     if (rnd() < CONFIG.symmetry.midCycleChance) setFold(pickFold());
   }
-  // hue eases toward its target; never faster than the arc
+  // hue eases toward its target; never faster than the arc. Touch moves the
+  // target, so even an abrupt bias change arrives over ~34s.
+  hueTarget = hueRoll + bias.hue * CONFIG.touch.hueDeg;
   hueCurrent += (hueTarget - hueCurrent) * (1 - Math.exp(-dt / CONFIG.palette.hueEaseSec));
 }
 
@@ -1238,13 +1279,18 @@ function makeGeo() {
 const GEO = [makeGeo(), makeGeo(), makeGeo(), makeGeo()];
 
 let _gx = 0, _gy = 0, _glen = 0;
-function ringPolyline(path, A, e, h, n, phi, steps, t0f, t1f) {
+/* r(t) = A(1 + e cos(hNt) + e2 cos(2hNt)) over t in [0, PI/N].
+   Both terms have zero derivative at t = 0 and t = PI/N, so the reassembled
+   curve stays smooth across every mirror line however the finger reshapes it. */
+function ringPolyline(path, A, e, h, n, phi, steps, t0f, t1f, e2) {
   const a0 = phi * t0f, a1 = phi * t1f;
+  const h2 = e2 || 0;
   let px = 0, py = 0;
   _glen = 0;
   for (let s = 0; s <= steps; s++) {
     const t = a0 + (a1 - a0) * (s / steps);
-    const r = A * (1 + e * Math.cos(h * n * t));
+    const hn = h * n * t;
+    const r = A * (1 + e * Math.cos(hn) + h2 * Math.cos(2 * hn));
     const x = r * Math.cos(t), y = r * Math.sin(t);
     if (s === 0) path.moveTo(x, y);
     else { path.lineTo(x, y); _glen += Math.hypot(x - px, y - py); }
@@ -1294,21 +1340,35 @@ function buildGeometry(m, gp, n, stamps, t, weight) {
   // the whole radius and always include the outermost one -- REST stays WIDE
   // and sparse instead of collapsing inward.
   const A = [], E = [], HH = [];
+  const TB = CONFIG.touch;
+  // Touch reshapes the material itself: ring spacing spreads or compresses
+  // about their mean, petal depth deepens or smooths, and a second harmonic
+  // rides in on top when the finger has been asking for elaboration.
+  const spread = 1 + TB.ringSpread * bias.ringR;
+  const depth = clamp(1 + TB.harmonicDepth * bias.harmonic, 0.25, 1.7);
+  const e2amt = Math.max(0, bias.harmonic) * CONFIG.geometry.eccMax * 0.55;
+  let meanR = 0;
   for (let i = 0; i < rings; i++) {
     const src = rings === 1 ? m.rings - 1 : Math.round(i * (m.rings - 1) / (rings - 1));
-    A.push(m.ringR[src] * Rc * breathe * (1 + 0.02 * Math.sin(t * 0.029 + src * 2.3)));
-    E.push(m.ringE[src]); HH.push(m.ringH[src]);
+    meanR += m.ringR[src];
+  }
+  meanR /= rings;
+  for (let i = 0; i < rings; i++) {
+    const src = rings === 1 ? m.rings - 1 : Math.round(i * (m.rings - 1) / (rings - 1));
+    const rr_ = Math.max(0.06, meanR + (m.ringR[src] - meanR) * spread);
+    A.push(rr_ * Rc * breathe * (1 + 0.02 * Math.sin(t * 0.029 + src * 2.3)));
+    E.push(m.ringE[src] * depth); HH.push(m.ringH[src]);
   }
 
   const boldIdx = rings > 1 ? (rings - 1) : 0;   // the outermost surviving ring
   const skip = clamp(1 + (m.skip % Math.max(1, Math.floor(n / 2))), 1, Math.min(4, Math.max(1, Math.floor(n / 2) - 1)));
 
   if (family === 'radial') {
-    let L = ringPolyline(gp.bold, A[boldIdx], E[boldIdx], HH[boldIdx], n, phi, steps, 0, 1);
+    let L = ringPolyline(gp.bold, A[boldIdx], E[boldIdx], HH[boldIdx], n, phi, steps, 0, 1, e2amt);
     addInk(L, A[boldIdx], wBold, stamps, weight);
     for (let i = 0; i < rings; i++) {
       if (i === boldIdx) continue;
-      L = ringPolyline(gp.mid, A[i], E[i], HH[i], n, phi, steps, 0, 1);
+      L = ringPolyline(gp.mid, A[i], E[i], HH[i], n, phi, steps, 0, 1, e2amt);
       addInk(L, A[i], wMid, stamps, weight);
     }
     if (amt > 0.45) {
@@ -1331,7 +1391,7 @@ function buildGeometry(m, gp, n, stamps, t, weight) {
         L = chord(gp.mid, A[i], a0, A[i], a0 + Math.max(1, skip - 1) * seg);
         addInk(L, Math.hypot(_gx, _gy), wMid, stamps, weight);
       } else {
-        L = ringPolyline(gp.mid, A[i], E[i], HH[i], n, phi, steps, 0, 1);
+        L = ringPolyline(gp.mid, A[i], E[i], HH[i], n, phi, steps, 0, 1, e2amt);
         addInk(L, A[i], wMid, stamps, weight);
       }
     }
@@ -1352,19 +1412,19 @@ function buildGeometry(m, gp, n, stamps, t, weight) {
       addInk(L, _gx, wMid, stamps, weight);
     }
     for (let i = 0; i < rings; i += 2) {
-      const L2 = ringPolyline(gp.mid, A[i], E[i], HH[i], n, phi, steps, 0, 1);
+      const L2 = ringPolyline(gp.mid, A[i], E[i], HH[i], n, phi, steps, 0, 1, e2amt);
       addInk(L2, A[i], wMid, stamps, weight);
     }
   } else { // woven
     const g = m.gapFrac;
-    let L = ringPolyline(gp.bold, A[boldIdx], E[boldIdx], HH[boldIdx], n, phi, steps, 0, 0.5 - g);
+    let L = ringPolyline(gp.bold, A[boldIdx], E[boldIdx], HH[boldIdx], n, phi, steps, 0, 0.5 - g, e2amt);
     addInk(L, A[boldIdx], wBold, stamps, weight);
-    L = ringPolyline(gp.bold, A[boldIdx], E[boldIdx], HH[boldIdx], n, phi, steps, 0.5 + g, 1);
+    L = ringPolyline(gp.bold, A[boldIdx], E[boldIdx], HH[boldIdx], n, phi, steps, 0.5 + g, 1, e2amt);
     addInk(L, A[boldIdx], wBold, stamps, weight);
     for (let i = 0; i < rings; i++) {
       if (i === boldIdx) continue;
       const off = (i % 2) * 0.5;
-      L = ringPolyline(gp.mid, A[i], E[i], HH[i], n, phi, steps, off * 0.5, 1 - off * 0.5);
+      L = ringPolyline(gp.mid, A[i], E[i], HH[i], n, phi, steps, off * 0.5, 1 - off * 0.5, e2amt);
       addInk(L, A[i], wMid, stamps, weight);
     }
     if (amt > 0.4) {
@@ -1382,7 +1442,7 @@ function buildGeometry(m, gp, n, stamps, t, weight) {
     if (k > 0.02) {
       for (let i = 0; i < m.fineR.length; i++) {
         const Ar = m.fineR[i] * Rc * breathe;
-        const L = ringPolyline(gp.fine, Ar, m.fineE[i] * (0.6 + 0.4 * amt), m.fineH[i], n, phi, steps + 5, 0, 1);
+        const L = ringPolyline(gp.fine, Ar, m.fineE[i] * (0.6 + 0.4 * amt) * depth, m.fineH[i], n, phi, steps + 5, 0, 1, e2amt);
         gp.hasFine = 1;
         addInk(L, Ar, wFine, stamps, weight);
       }
@@ -1631,7 +1691,7 @@ const WELLS = [];
 for (let i = 0; i < CONFIG.touch.maxPointers; i++) {
   WELLS.push({ id: -1, held: false, sx: 0, sy: 0, psx: 0, psy: 0,
                fx: 0, fy: 0, fk: 0, fm: 1, r2: 1, s: 0, pending: 0,
-               dwell: 0, depX: 0, depY: 0, moved: 0,
+               dwell: 0, depX: 0, depY: 0, moved: 0, dx: 0, dy: 0,
                vx: 0, vy: 0, spin: 1, pull: 1, force: 1, decay: 6 });
 }
 // Ring buffer of decaying vortices dropped along a drag. Fixed size, written
@@ -1724,6 +1784,7 @@ function updateWells(dt) {
       wl.s = Math.min(1, wl.s + rise);
       const ddx = wl.sx - wl.psx, ddy = wl.sy - wl.psy;
       wl.psx = wl.sx; wl.psy = wl.sy;
+      wl.dx = ddx; wl.dy = ddy;      // kept: psx/psy have already advanced
       const step = Math.hypot(ddx, ddy);
       wl.moved = wl.moved * 0.7 + step * 0.3;
       // stillness accrues, movement spends it
@@ -1756,6 +1817,7 @@ function updateWells(dt) {
       }
     } else if (wl.s > 0 || wl.pending > 0) {
       wl.dwell = Math.max(0, wl.dwell - dt * 1.5);
+      wl.dx = 0; wl.dy = 0;
       if (wl.pending > 0) {
         wl.s = Math.min(wl.pending, wl.s + rise);
         if (wl.s >= wl.pending - 1e-4) wl.pending = 0;
@@ -1771,6 +1833,40 @@ function updateWells(dt) {
   }
   wellCount = active;
   glowGate = slew(glowGate, active > 0 ? 1 : 0, 2.5, dt);
+
+  // ---- contact shapes the material
+  const br = T.biasRatePerSec * dt * rmTouch;
+  for (let i = 0; i < WELLS.length; i++) {
+    const wl = WELLS[i];
+    if (wl.s <= 0.02) continue;
+    const rr_ = Math.hypot(wl.fx, wl.fy) * SC / Math.max(1, Rc);   // in Rc units
+    // where you touch: inside the motif smooths it, outside elaborates it
+    const radial = clamp((rr_ - 0.62) / 0.62, -1, 1);
+    biasWant.harmonic = clamp(biasWant.harmonic + radial * wl.s * br, -1, 1);
+    biasWant.fold = clamp(biasWant.fold + radial * wl.s * br * 0.55, -1, 1);
+    // holding still out past the rings spreads them; holding inside draws them in
+    if (wl.dwell > T.dwellOnsetSec) {
+      let mr = 0;
+      for (let g = 0; g < ringN; g++) mr += RINGR[g];
+      mr = ringN ? mr / (ringN * Math.max(1, Rc)) : 0.6;
+      biasWant.ringR = clamp(biasWant.ringR + Math.sign(rr_ - mr) * wl.s * br * 0.8, -1, 1);
+    }
+    // stirring one way round warms the palette, the other cools it
+    const ox = wl.sx - cxCss, oy = wl.sy - cyCss;
+    const spin = ox * wl.dy - oy * wl.dx;
+    if (spin !== 0) {
+      const mag = Math.max(1, Math.hypot(ox, oy) * 6);
+      biasWant.hue = clamp(biasWant.hue + clamp(spin / mag, -1, 1) * wl.s * br * 0.9, -1, 1);
+    }
+    // agitation vs stillness decides how restless the next motif will be
+    const agit = clamp(wl.moved / 14 - 0.35, -1, 1);
+    biasWant.family = clamp(biasWant.family + agit * wl.s * br * 0.7, -1, 1);
+  }
+  const bDecay = Math.exp(-dt / T.biasDecaySec);
+  for (const k in biasWant) {
+    biasWant[k] = clamp(biasWant[k] * bDecay, -1, 1);   // bounded on every path
+    bias[k] = slew(bias[k], biasWant[k], T.biasSlewPerSec, dt);
+  }
 
   // ---- wakes fade on their own clock
   const wDecay = Math.exp(-dt / T.wakeLifeSec);
@@ -1885,6 +1981,8 @@ function updateDebug(dt) {
     '\nphase  ' + CONFIG.arc.names[arc.phase] + '  ' + (arc.phaseProg * 100).toFixed(0) + '%' +
     '\ncycle  ' + (arc.p * 100).toFixed(1) + '%  of ' + arc.len.toFixed(0) + 's  #' + arc.cycle +
     '\nfold   ' + fold +
+    '\nbias   h' + bias.harmonic.toFixed(2) + ' r' + bias.ringR.toFixed(2) +
+      ' c' + bias.hue.toFixed(2) + ' N' + bias.fold.toFixed(2) + ' f' + bias.family.toFixed(2) +
     '\nqual   ' + quality.toFixed(2) + '  ink× ' + inkScale.toFixed(2) +
     '  fine ' + fineScale.toFixed(2) +
     '\nseed   ' + SEED;
