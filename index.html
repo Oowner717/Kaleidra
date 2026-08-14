@@ -132,7 +132,7 @@ const CONFIG = {
       cohesion:  [0.44,  0.92,   0.86,  0.44,   0.46], // lattice tightness
       // BLOOM's ink ceiling is deliberately BELOW GATHER's: the peak is
       // brighter and more resolved, never denser.
-      inkBudget: [0.085, 0.185,  0.120, 0.150,  0.095],
+      inkBudget: [0.100, 0.190,  0.135, 0.165,  0.110],
       focusR:    [0.72,  0.52,   0.34,  0.80,   0.66], // focal radius, Rc units
       voidMix:   [0.30,  0.70,   0.45,  0.10,   0.35], // 0 open margin .. 1 clean margin
     },
@@ -177,7 +177,9 @@ const CONFIG = {
     // The count is kept deliberately low -- fewer elements, longer and
     // brighter, is the whole restraint rule.
     max: 340,
-    base: 230,            // at the reference fold (2N = 10)
+    base: 290,            // at the reference fold (2N = 10). Raised with the
+                          // larger compositional radius: the field now reads
+                          // across the whole frame, so it needs populating.
     foldComp: 0.60,       // count scales by (10/2N)^foldComp, so higher folds
                           // do not multiply into a uniform mesh
     dotFrac: 0.050,       // role 0: bold points  (the "few bold primaries")
@@ -245,7 +247,9 @@ const CONFIG = {
   /* ---- harmonic geometry layer ---------------------------------------- */
   geometry: {
     ringsMin: 4, ringsMax: 7,
-    radiusInner: 0.20, radiusOuter: 0.98,  // in Rc units
+    radiusInner: 0.16, radiusOuter: 1.15,  // in Rc units; >1 so the outer
+                                           // rings cross the frame edge and the
+                                           // figure never reads as contained
     eccMax: 0.16,                          // harmonic ring eccentricity
     harmonics: [1, 2, 3],
     arcSteps: 13,          // polyline steps per wedge for harmonic rings
@@ -298,14 +302,19 @@ const CONFIG = {
     breathHz: 0.137,         // human breath rate
     breathLum: 0.075,
     breathScale: 0.026,
-    anchorRFrac: 0.048,      // stable centre anchor, in Rc units
+    anchorRFrac: 0.032,      // stable centre anchor, in Rc units
   },
 
   /* ---- composition: negative space is a feature ----------------------- */
   composition: {
-    innerVoid: [0.26, 0.07],   // Rc units, at voidMix 0 -> 1
-    outerLimit: [0.92, 0.66],  // field-radius units, at voidMix 0 -> 1
-    radialQuiet: 0.80,         // how far the field dims outside Rc, so the
+    // Rc is the compositional radius. At 0 it is the minor viewport dimension,
+    // at 1 the half-diagonal. Sizing purely to the minor dimension left the top
+    // and bottom sixths of a tall phone 20-40x dimmer than the middle -- a
+    // circle in a rectangle, with most of the screen unused.
+    fillBias: 0.45,
+    innerVoid: [0.20, 0.05],   // Rc units, at voidMix 0 -> 1
+    outerLimit: [1.04, 0.84],  // field-radius units, at voidMix 0 -> 1
+    radialQuiet: 0.34,         // how far the field dims outside Rc, so the
                                // composition reads at the minor dimension while
                                // the field still runs past the frame
     focusGain: 1.34,           // luminance multiplier at the focal radius
@@ -314,7 +323,7 @@ const CONFIG = {
     // Beyond tierIn the lattice hands over to the fine tier, one link at a
     // time, so the readable composition stays at the minor dimension while the
     // field itself still runs off the edge of the frame.
-    tierIn: 1.05, tierOut: 1.80,   // Rc units
+    tierIn: 0.95, tierOut: 1.55,   // Rc units
   },
 
   /* ---- bloom: this is where "flashy" comes from ----------------------- */
@@ -415,6 +424,27 @@ const CONFIG = {
     qualityRecoverPerSec: 0.07,
     bloomShedBelow: 0.45,  // shed density well before shedding bloom
     smoothing: 0.06,
+  },
+
+  /* ---- travelling radial pulses --------------------------------------
+     A band of lift that walks from the centre out to the rim over ~26s. It
+     arrives on its own every half-minute or so, and a touch launches one from
+     wherever the finger landed -- so the piece keeps changing on its own, and
+     answers a touch with something that outlives the contact by a long way.
+     ------------------------------------------------------------------- */
+  pulse: {
+    slots: 3,
+    travelSec: 26,
+    riseSec: 1.2,
+    width: 0.13,           // half-width, in field-radius units
+    gain: 0.40,            // peak lift inside the band
+    fadeFrom: 0.55, fadeTo: 1.05,
+    spontaneousSec: [30, 68],
+    touchAmp: 0.72,
+    touchMinGapSec: 6,     // so tapping cannot chain pulses
+    maxSum: 1.2,
+    focusYield: 0.6,       // the static focal band steps back for a passing
+                           // pulse: still one focal event at a time
   },
 
   /* ---- debug ----------------------------------------------------------- */
@@ -801,6 +831,46 @@ function activeFolds() {
    ========================================================================== */
 const comp = { innerVoid: 0.2, outerLimit: 0.9, focusR: 0.5 };
 
+const PULSE = [];
+for (let i = 0; i < CONFIG.pulse.slots; i++) PULSE.push({ r: 9, s: 0, amp: 1, age: 0, live: false });
+let pulseSum = 0, pulseTimer = rr(8, 20), pulseGap = 99;
+
+function launchPulse(atR, amp) {
+  let slot = null;
+  for (let i = 0; i < PULSE.length; i++) if (!PULSE[i].live) { slot = PULSE[i]; break; }
+  if (!slot) {                       // reuse whichever is furthest along
+    slot = PULSE[0];
+    for (let i = 1; i < PULSE.length; i++) if (PULSE[i].r > slot.r) slot = PULSE[i];
+  }
+  slot.r = clamp(atR, 0.04, 0.9); slot.s = 0; slot.amp = amp; slot.age = 0; slot.live = true;
+}
+
+function updatePulses(dt) {
+  const P = CONFIG.pulse;
+  const speed = 1 / (P.travelSec * rmTransition);
+  pulseTimer -= dt;
+  pulseGap += dt;
+  if (pulseTimer <= 0) {
+    pulseTimer = rr(P.spontaneousSec[0], P.spontaneousSec[1]) * rmTransition;
+    launchPulse(comp.innerVoid * RcN * 1.2, 1);
+  }
+  pulseSum = 0;
+  for (let i = 0; i < PULSE.length; i++) {
+    const q = PULSE[i];
+    if (!q.live) { q.s = 0; continue; }
+    q.age += dt; q.r += speed * dt;
+    if (q.r > P.fadeTo) { q.live = false; q.s = 0; continue; }
+    q.s = q.amp * smoothstep(q.age / (P.riseSec * rmTransition)) *
+          clamp(1 - (q.r - P.fadeFrom) / (P.fadeTo - P.fadeFrom), 0, 1);
+    pulseSum += q.s;
+  }
+  if (pulseSum > P.maxSum) {         // bounded however many are in flight
+    const k = P.maxSum / pulseSum;
+    for (let i = 0; i < PULSE.length; i++) PULSE[i].s *= k;
+    pulseSum = P.maxSum;
+  }
+}
+
 function updateComposition() {
   const C = CONFIG.composition, v = arc.v;
   comp.innerVoid = lerp(C.innerVoid[0], C.innerVoid[1], v.voidMix);
@@ -835,11 +905,24 @@ function envelope(u) {
 
   const d = Math.abs(u - fuN) / fwN;
   const k = d >= 1 ? 0 : (1 - d * d) * (1 - d * d);
-  a *= C.focusQuiet + (C.focusGain - C.focusQuiet) * k;
-  return a < 0 ? 0 : a > 1.5 ? 1.5 : a;
+  // The static focal band steps back while a pulse is crossing, so the piece
+  // still only ever has one focal event at a time.
+  const P = CONFIG.pulse;
+  const gain = C.focusGain * (1 - P.focusYield * Math.min(1, pulseSum));
+  a *= C.focusQuiet + (gain - C.focusQuiet) * k;
+
+  let lift = 0;
+  for (let i = 0; i < PULSE.length; i++) {
+    const q = PULSE[i];
+    if (q.s <= 0.002) continue;
+    const e = (u - q.r) / P.width;
+    if (e > -1 && e < 1) { const b = 1 - e * e; lift += q.s * b * b; }
+  }
+  a *= 1 + P.gain * lift;
+  return a < 0 ? 0 : a > 2.2 ? 2.2 : a;
 }
 
-const GRAD_STOPS = 16;
+const GRAD_STOPS = 22;   // enough radial resolution to render a pulse band
 const _cmix = [0, 0, 0];
 /* Interpolates in OKLCH along the short way round the hue circle. A straight
    sRGB lerp between, say, turquoise and gold passes through grey -- the mid
@@ -1551,7 +1634,7 @@ function resize() {
 
   Rdiag = 0.5 * Math.hypot(W, H);
   Rfield = Rdiag * CONFIG.core.fieldCover;
-  Rc = 0.5 * Math.min(W, H);
+  Rc = lerp(0.5 * Math.min(W, H), 0.5 * Math.hypot(W, H), CONFIG.composition.fillBias);
   RcN = Rc / Rfield;
   B = Rfield;
   hashRMax = B * 0.94;
@@ -1742,6 +1825,10 @@ function onDown(e) {
   wl.pull = rnd() < 0.68 ? -1 : 1;              // mostly a gentle repulsor
   wl.decay = rr(CONFIG.touch.decayMinSec, CONFIG.touch.decayMaxSec);
   foldScreen(wl.sx, wl.sy, wl);
+  if (pulseGap >= CONFIG.pulse.touchMinGapSec) {
+    pulseGap = 0;
+    launchPulse(Math.hypot(wl.fx, wl.fy) * SC / Math.max(1, Rfield), CONFIG.pulse.touchAmp);
+  }
 }
 
 function onMove(e) {
@@ -1981,6 +2068,7 @@ function updateDebug(dt) {
     '\nphase  ' + CONFIG.arc.names[arc.phase] + '  ' + (arc.phaseProg * 100).toFixed(0) + '%' +
     '\ncycle  ' + (arc.p * 100).toFixed(1) + '%  of ' + arc.len.toFixed(0) + 's  #' + arc.cycle +
     '\nfold   ' + fold +
+    '\npulse  ' + PULSE.filter(q => q.live).length + '  sum ' + pulseSum.toFixed(2) +
     '\nbias   h' + bias.harmonic.toFixed(2) + ' r' + bias.ringR.toFixed(2) +
       ' c' + bias.hue.toFixed(2) + ' N' + bias.fold.toFixed(2) + ' f' + bias.family.toFixed(2) +
     '\nqual   ' + quality.toFixed(2) + '  ink× ' + inkScale.toFixed(2) +
@@ -2168,6 +2256,7 @@ function frame(now) {
   updateSym(dt);
   activeFolds();
   updateComposition();
+  updatePulses(dt);
   updatePalette(clock);
 
   // trance: breathing, rotation, geometry drift
