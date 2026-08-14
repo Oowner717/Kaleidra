@@ -128,7 +128,7 @@ const CONFIG = {
       bloom:     [0.40,  0.58,   1.15,  0.50,   0.36],
       expand:    [0.96,  0.99,   1.07,  1.15,   0.98],
       // Fewer rings at the peak, not more: what remains is what resolves.
-      geometry:  [0.34,  0.84,   0.60,  0.42,   0.34],
+      geometry:  [0.40,  0.95,   0.68,  0.50,   0.40],
       cohesion:  [0.44,  0.92,   0.86,  0.44,   0.46], // lattice tightness
       // BLOOM's ink ceiling is deliberately BELOW GATHER's: the peak is
       // brighter and more resolved, never denser.
@@ -234,6 +234,9 @@ const CONFIG = {
     geoMidWidth: 1.02, geoMidAlpha: 0.027,
     geoFineWidth: 0.58, geoFineAlpha: 0.0115,
     dotRadius: 2.6, dotWidth: 1.60, dotAlpha: 0.095,
+    // Anamorphic glints on the bold points: a long radial streak and a short
+    // cross. Reads as light catching an edge, and costs almost no ink.
+    streakLen: 26.0, streakCross: 0.30, streakWidth: 0.55, streakAlpha: 0.055,
     anchorAlpha: 0.055,
     minFineScale: 0.0,   // the fine tier may be shed all the way out
     minMidScale: 0.34,   // the lattice is never shed below this
@@ -241,15 +244,21 @@ const CONFIG = {
 
   /* ---- harmonic geometry layer ---------------------------------------- */
   geometry: {
-    ringsMin: 3, ringsMax: 6,
+    ringsMin: 4, ringsMax: 7,
     radiusInner: 0.20, radiusOuter: 0.98,  // in Rc units
     eccMax: 0.16,                          // harmonic ring eccentricity
     harmonics: [1, 2, 3],
     arcSteps: 13,          // polyline steps per wedge for harmonic rings
     families: ['radial', 'spiral', 'polygonal', 'woven'],
     crossfadeSec: 13,
-    tieCount: 2,
-    fineTraceRings: 2,
+    // The harmonic paths are rebuilt every N frames, not every frame. Their
+    // radii breathe at ~0.0014/sec, so a 4-frame step is ~0.0001 of relative
+    // change -- invisible -- while rotation, scale and breathing keep coming
+    // from the transform every frame and stay perfectly smooth. Path building
+    // was 9ms/frame in the worst case (fold 12 + both crossfades) without this.
+    rebuildFrames: 4,
+    tieCount: 3,
+    fineTraceRings: 3,
   },
 
   /* ---- palette -------------------------------------------------------- */
@@ -315,6 +324,12 @@ const CONFIG = {
     wideWeight: 0.58,      // the widest halo, kept restrained so strokes keep
     midWeight:  0.62,      // a crisp core instead of dissolving into haze
     brightBoost: 1.45,     // bright-pass stroke alpha multiplier
+    // Radial zoom-bloom: the halo is stacked at increasing scales about the
+    // centre, which throws light outward along the symmetry. The weights are
+    // normalised back to midWeight, so this changes the SHAPE of the glow and
+    // not its total energy -- global luminance is untouched by construction.
+    zoomScales: [1.0, 1.045, 1.10],
+    zoomWeights: [1.0, 0.42, 0.20],
   },
 
   /* ---- ink: restraint, measured ---------------------------------------- */
@@ -341,8 +356,33 @@ const CONFIG = {
     radial: 0.22,           // weak attract/repel
     dragGain: 0.55,
     dragMaxPxPerSec: 900,
-    detailGain: 1.42,       // local link-radius bloom under the finger
-    glowAlpha: 0.024,
+    detailGain: 1.62,       // local link-radius bloom under the finger
+    glowAlpha: 0.028,
+    // --- wake: a drag deposits decaying vorticity ALONG its path, so the
+    //     whole stroke keeps stirring after the finger has gone, not just the
+    //     point it ended at.
+    wakeCount: 20,
+    wakeSpacing: 0.42,      // deposit spacing, in touch-radius units
+    wakeLifeSec: 7.5,
+    wakeRadius: 0.5,        // of the touch radius
+    wakeSwirl: 0.62, wakeDrag: 0.5,
+    // --- dwell: holding still crystallises the lattice locally, drawing
+    //     nearby nodes onto the harmonic ring radii. Stillness is rewarded.
+    dwellMoveTol: 2.4,      // CSS px/frame counted as "still"
+    dwellOnsetSec: 0.9, dwellFullSec: 3.2,
+    dwellSnap: 1.35,        // radial pull toward the nearest ring
+    // --- two fingers: pinch breathes the composition, twist leans the
+    //     rotation. Both are hard-bounded and decay back on their own, so the
+    //     pattern is never actually under the user's control.
+    pinchGain: 0.55, pinchMax: 0.07,
+    twistGain: 0.30, twistMax: 0.0045,   // radians/sec (~0.26 deg/s)
+    gestureDecaySec: 5.0,
+    // Gestures are rate-limited on the way in as well as bounded. Scale is a
+    // large-area luminance change (the same ink spread over more screen), so a
+    // fast pinch would otherwise breach the 10%-per-300ms ceiling; 0.12/s caps
+    // it at ~3.6% per 300ms. Rotation is slewed so motion never steps either.
+    pinchRatePerSec: 0.12,
+    twistRatePerSec: 0.008,
     arcNudgeMaxFrac: 0.10,  // at most +-10% of a cycle, per cycle
     arcNudgeRate: 0.26,     // clock runs at most 26% faster while touched
     arcNudgeSmoothSec: 2.4, // rapid tapping cannot chain blooms
@@ -972,7 +1012,8 @@ function updateNodes(dt) {
   const inertia = 1 - Math.exp(-dt / CONFIG.flow.inertiaSec);
   const tempo = arc.v.tempo;
   const twoB = 2 * B;
-  const wellsOn = wellCount > 0;
+  const wellsOn = wellCount > 0 || wakeLive > 0;
+  const T = CONFIG.touch;
   const fn = (sym.x < 1 && sym.x > 0.5) ? sym.nxt : sym.cur;
   const seg = TAU / fn, half = seg * 0.5;
 
@@ -994,6 +1035,8 @@ function updateNodes(dt) {
       if (t > half) { t = seg - t; m = -1; k = k + 1; }
       const px = r * Math.cos(t), py = r * Math.sin(t);
       let ffx = 0, ffy = 0;
+      const wrad = CONFIG.touch.wakeRadius * touchRF, wl0r2 = wrad * wrad;
+      const wforce = CONFIG.flow.speedPx * Rfield * 2.1 * rmTouch;
       for (let wi = 0; wi < WELLS.length; wi++) {
         const wl = WELLS[wi];
         if (wl.s <= 0.001) continue;
@@ -1010,6 +1053,35 @@ function updateNodes(dt) {
         ffx += wl.vx * fall * T.dragGain;
         ffy += wl.vy * fall * T.dragGain;
         if (fall > 0.04) nboost[i] = Math.max(nboost[i], 1 + (T.detailGain - 1) * fall);
+
+        // Dwell: a finger held still draws the lattice onto the harmonic ring
+        // radii under it -- structure sharpens where attention rests.
+        if (wl.dwell > T.dwellOnsetSec && ringN > 0) {
+          const k = smoothstep((wl.dwell - T.dwellOnsetSec) / (T.dwellFullSec - T.dwellOnsetSec));
+          let best = RINGR[0], bd = Math.abs(r - RINGR[0]);
+          for (let g = 1; g < ringN; g++) {
+            const dd = Math.abs(r - RINGR[g]);
+            if (dd < bd) { bd = dd; best = RINGR[g]; }
+          }
+          // radial, so it needs no fold mapping: folding preserves radius
+          const pull = (best - r) * k * fall * T.dwellSnap;
+          if (r > 1e-3) { vx += (x / r) * pull * dt; vy += (y / r) * pull * dt; }
+        }
+      }
+
+      // Wakes left along a drag keep stirring after the finger has gone.
+      for (let wi = 0; wi < WAKE.length; wi++) {
+        const wk = WAKE[wi];
+        if (wk.s <= 0.01) continue;
+        const dx = px - wk.fx, dy = py - wk.fy;
+        const wr = wl0r2;
+        const d2 = dx * dx + dy * dy;
+        if (d2 >= wr) continue;
+        const d = Math.sqrt(d2) + 1e-5;
+        const q = 1 - d2 / wr;
+        const fall = q * q * wk.s;
+        ffx += (-dy / d) * T.wakeSwirl * fall * wforce + wk.vx * fall * T.wakeDrag;
+        ffy += (dx / d) * T.wakeSwirl * fall * wforce + wk.vy * fall * T.wakeDrag;
       }
       if (ffx !== 0 || ffy !== 0) {
         const ang = (k % fn) * seg, ca = Math.cos(ang), sa = Math.sin(ang);
@@ -1158,8 +1230,12 @@ function buildLinks(linkR, stamps, md) {
    vanishes at both wedge edges, so the reassembled curve is smooth across the
    mirror lines -- petals, not corners, and no visible spokes.
    ========================================================================== */
-function makeGeo() { return { bold: new Path2D(), mid: new Path2D(), fine: new Path2D(), hasFine: 0 }; }
-const geoA = makeGeo(), geoB = makeGeo();
+function makeGeo() {
+  return { bold: new Path2D(), mid: new Path2D(), fine: new Path2D(), hasFine: 0,
+           n: -1, m: null, frame: -1e9, ink: 0 };
+}
+// One cache slot per (fold set, motif): at most two of each during crossfades.
+const GEO = [makeGeo(), makeGeo(), makeGeo(), makeGeo()];
 
 let _gx = 0, _gy = 0, _glen = 0;
 function ringPolyline(path, A, e, h, n, phi, steps, t0f, t1f) {
@@ -1521,10 +1597,23 @@ function bloomPass() {
   bBctx.globalAlpha = CONFIG.bloom.wideWeight;
   bBctx.drawImage(bC, 0, 0, bB.width, bB.height);
 
+  // Stack the halo at increasing scales about the centre: light thrown
+  // outward along the symmetry. Weights normalise back to midWeight, so the
+  // glow changes shape without changing how much light it adds.
   bActx.setTransform(1, 0, 0, 1, 0, 0);
   bActx.globalCompositeOperation = 'lighter';
-  bActx.globalAlpha = CONFIG.bloom.midWeight;
-  bActx.drawImage(bB, 0, 0, bA.width, bA.height);
+  const ZS = CONFIG.bloom.zoomScales, ZW = CONFIG.bloom.zoomWeights;
+  // Each extra scale is another blit, and blits -- not JS -- are what this
+  // piece actually spends its frame on. Shed the outer rays first on slow
+  // hardware; the glow narrows rather than disappearing.
+  const zN = quality < CONFIG.perf.bloomShedBelow ? 1 : quality < 0.72 ? 2 : ZS.length;
+  let zsum = 0;
+  for (let i = 0; i < zN; i++) zsum += ZW[i];
+  for (let i = 0; i < zN; i++) {
+    const sc = ZS[i], zw = bA.width * sc, zh = bA.height * sc;
+    bActx.globalAlpha = CONFIG.bloom.midWeight * ZW[i] / zsum;
+    bActx.drawImage(bB, (bA.width - zw) * 0.5, (bA.height - zh) * 0.5, zw, zh);
+  }
 
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.globalCompositeOperation = 'lighter';
@@ -1542,8 +1631,19 @@ const WELLS = [];
 for (let i = 0; i < CONFIG.touch.maxPointers; i++) {
   WELLS.push({ id: -1, held: false, sx: 0, sy: 0, psx: 0, psy: 0,
                fx: 0, fy: 0, fk: 0, fm: 1, r2: 1, s: 0, pending: 0,
+               dwell: 0, depX: 0, depY: 0, moved: 0,
                vx: 0, vy: 0, spin: 1, pull: 1, force: 1, decay: 6 });
 }
+// Ring buffer of decaying vortices dropped along a drag. Fixed size, written
+// through a cursor -- no allocation, and old wakes die on their own.
+const WAKE = [];
+for (let i = 0; i < CONFIG.touch.wakeCount; i++) WAKE.push({ fx: 0, fy: 0, vx: 0, vy: 0, s: 0 });
+let wakeCursor = 0, wakeLive = 0;
+let tfDist = -1, tfAng = 0;
+let touchScaleWant = 0, touchRotWant = 0;   // gesture accumulators
+let touchScaleBias = 0, touchRotBias = 0;   // rate-limited values actually applied
+const RINGR = new Float32Array(8);
+let ringN = 0;
 let wellCount = 0;
 let glowGate = 0;
 let touchR = 40, touchRF = 40;
@@ -1575,7 +1675,7 @@ function onDown(e) {
   for (let i = 0; i < WELLS.length; i++) if (WELLS[i].id < 0 && WELLS[i].s <= 0.02) { wl = WELLS[i]; break; }
   if (!wl) for (let i = 0; i < WELLS.length; i++) if (WELLS[i].id < 0) { wl = WELLS[i]; break; }
   if (!wl) return;
-  wl.id = e.pointerId; wl.held = true; wl.pending = 0;
+  wl.id = e.pointerId; wl.held = true; wl.pending = 0; wl.dwell = 0; wl.moved = 0;
   wl.sx = wl.psx = e.clientX; wl.sy = wl.psy = e.clientY;
   wl.vx = wl.vy = 0;
   wl.spin = rnd() < 0.5 ? 1 : -1;
@@ -1600,6 +1700,15 @@ function onUp(e) {
   wl.pending = wl.s < CONFIG.touch.tapImpulse ? CONFIG.touch.tapImpulse : 0;
 }
 
+/* The radii the geometry layer is currently drawing, so a dwelling finger can
+   pull the lattice onto them. */
+function updateRings() {
+  const m = motifA;
+  ringN = Math.min(RINGR.length, m.rings);
+  const breathe = 1 + 0.035 * Math.sin(clock * 0.041 + m.phase);
+  for (let i = 0; i < ringN; i++) RINGR[i] = m.ringR[i] * Rc * breathe;
+}
+
 function updateWells(dt) {
   const T = CONFIG.touch;
   touchR = T.radiusFrac * Math.min(W, H);
@@ -1615,7 +1724,20 @@ function updateWells(dt) {
       wl.s = Math.min(1, wl.s + rise);
       const ddx = wl.sx - wl.psx, ddy = wl.sy - wl.psy;
       wl.psx = wl.sx; wl.psy = wl.sy;
+      const step = Math.hypot(ddx, ddy);
+      wl.moved = wl.moved * 0.7 + step * 0.3;
+      // stillness accrues, movement spends it
+      if (wl.moved < T.dwellMoveTol) wl.dwell = Math.min(T.dwellFullSec * 1.4, wl.dwell + dt);
+      else wl.dwell = Math.max(0, wl.dwell - dt * 2.5);
       foldScreen(wl.sx, wl.sy, wl);
+      // drop a wake once the finger has travelled far enough since the last one
+      const spacing = T.wakeSpacing * touchRF;
+      if (Math.hypot(wl.fx - wl.depX, wl.fy - wl.depY) > spacing) {
+        const wk = WAKE[wakeCursor];
+        wakeCursor = (wakeCursor + 1) % WAKE.length;
+        wk.fx = wl.fx; wk.fy = wl.fy; wk.vx = wl.vx; wk.vy = wl.vy; wk.s = 1;
+        wl.depX = wl.fx; wl.depY = wl.fy;
+      }
       if (dt > 0 && (ddx !== 0 || ddy !== 0)) {
         // Directional velocity painted along the stroke, weighted by speed:
         // fast drags stir, slow drags bend.
@@ -1633,6 +1755,7 @@ function updateWells(dt) {
         wl.vx *= relaxTC; wl.vy *= relaxTC;
       }
     } else if (wl.s > 0 || wl.pending > 0) {
+      wl.dwell = Math.max(0, wl.dwell - dt * 1.5);
       if (wl.pending > 0) {
         wl.s = Math.min(wl.pending, wl.s + rise);
         if (wl.s >= wl.pending - 1e-4) wl.pending = 0;
@@ -1648,6 +1771,39 @@ function updateWells(dt) {
   }
   wellCount = active;
   glowGate = slew(glowGate, active > 0 ? 1 : 0, 2.5, dt);
+
+  // ---- wakes fade on their own clock
+  const wDecay = Math.exp(-dt / T.wakeLifeSec);
+  wakeLive = 0;
+  for (let i = 0; i < WAKE.length; i++) {
+    const wk = WAKE[i];
+    // Retire at the same threshold the force loop skips at, so a spent wake
+    // stops costing anything instead of idling below the visible floor.
+    if (wk.s <= 0.01) { wk.s = 0; continue; }
+    wk.s *= wDecay; wk.vx *= wDecay; wk.vy *= wDecay;
+    wakeLive++;
+  }
+
+  // ---- two fingers: pinch breathes, twist leans. Bounded and self-cancelling.
+  let h0 = -1, h1 = -1, hn = 0;
+  for (let i = 0; i < WELLS.length; i++) if (WELLS[i].held) { if (hn === 0) h0 = i; else if (hn === 1) h1 = i; hn++; }
+  if (hn === 2) {
+    const dx = WELLS[h1].sx - WELLS[h0].sx, dy = WELLS[h1].sy - WELLS[h0].sy;
+    const d = Math.hypot(dx, dy), a = Math.atan2(dy, dx);
+    if (tfDist > 0 && d > 24) {
+      const span = Math.max(60, Math.min(W, H));
+      touchScaleWant = clamp(touchScaleWant + ((d - tfDist) / span) * T.pinchGain * rmTouch,
+                             -T.pinchMax, T.pinchMax);
+      const da = ((a - tfAng + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+      touchRotWant = clamp(touchRotWant + da * T.twistGain * rmTouch, -T.twistMax, T.twistMax);
+    }
+    tfDist = d; tfAng = a;
+  } else tfDist = -1;
+  const gDecay = Math.exp(-dt / T.gestureDecaySec);
+  touchScaleWant *= gDecay;
+  touchRotWant *= gDecay;
+  touchScaleBias = slew(touchScaleBias, touchScaleWant, T.pinchRatePerSec, dt);
+  touchRotBias = slew(touchRotBias, touchRotWant, T.twistRatePerSec, dt);
 
   // ---- arc clock nudge: bounded, smoothed, and locked out at BLOOM so no
   //      amount of tapping can chain one bloom into another.
@@ -1737,9 +1893,9 @@ function updateDebug(dt) {
 /* ==========================================================================
    13  LOOP  -- lifecycle, adaptive quality, ink governor, main frame
    ========================================================================== */
-let clock = 0, lastT = 0, rafId = 0, breathPhase = rr(0, TAU), rotPhase = rr(0, TAU);
+let clock = 0, lastT = 0, rafId = 0, frameNo = 0, breathPhase = rr(0, TAU), rotPhase = rr(0, TAU);
 const pMid = [null, null, null], pFine = [null, null, null];
-let pDot = null;
+let pDot = null, pStreak = null, streakN = 0;
 
 /* Mean degree for this fold count. foldComp keeps ink roughly fold-independent:
    ink goes as degree^1.5 * sqrt(2n), so degree gets (10/2n)^(1/3). */
@@ -1776,6 +1932,8 @@ function buildLattice(n, w) {
 
   for (let k = 0; k < 3; k++) { pMid[k] = new Path2D(); pFine[k] = new Path2D(); }
   pDot = new Path2D();
+  pStreak = new Path2D();
+  streakN = 0;
 
   for (let l = 0; l < linkCount; l++) {
     const a = lkA[l], b = lkB[l];
@@ -1798,10 +1956,43 @@ function buildLattice(n, w) {
     pDot.moveTo(fxA[i] + rd, fyA[i]);
     pDot.arc(fxA[i], fyA[i], rd, 0, TAU);
     addInk(TAU * rd, nrad[i], CONFIG.tiers.dotWidth * widthScale, stamps, w);
+
+    // Anamorphic glint: a long streak along the radius plus a short cross.
+    // Radial, so every copy of it points out of the centre.
+    const rr_ = nrad[i];
+    if (rr_ > 1e-3) {
+      const T2 = CONFIG.tiers;
+      const half = T2.streakLen * widthScale * (rd / rd0) / (SC * 2);
+      const ux = fxA[i] / rr_, uy = fyA[i] / rr_;
+      pStreak.moveTo(fxA[i] - ux * half, fyA[i] - uy * half);
+      pStreak.lineTo(fxA[i] + ux * half, fyA[i] + uy * half);
+      const hc = half * T2.streakCross;
+      pStreak.moveTo(fxA[i] + uy * hc, fyA[i] - ux * hc);
+      pStreak.lineTo(fxA[i] - uy * hc, fyA[i] + ux * hc);
+      streakN++;
+      addInk(half * 2 * (1 + T2.streakCross), rr_, T2.streakWidth * widthScale, stamps, w);
+    }
   }
 }
 
-function renderFold(fs, gwA, gwB) {
+/* Returns a ready geometry slot, rebuilding it only when the fold count, the
+   motif, or the rebuild interval says it is stale. Ink is banked on rebuild and
+   re-declared on cached frames, so the governor still sees the true total. */
+function geoSlot(slot, m, n, stamps, weight) {
+  const g = GEO[slot];
+  if (g.n !== n || g.m !== m || (frameNo - g.frame) >= CONFIG.geometry.rebuildFrames) {
+    g.bold = new Path2D(); g.mid = new Path2D(); g.fine = new Path2D();
+    const before = inkAccum;
+    buildGeometry(m, g, n, stamps, clock, weight);
+    g.ink = inkAccum - before;
+    g.n = n; g.m = m; g.frame = frameNo;
+  } else {
+    inkAccum += g.ink;
+  }
+  return g;
+}
+
+function renderFold(fs, gwA, gwB, fi) {
   const n = fs.n, w = fs.w;
   if (w <= 0.002) return;
   const stamps = 2 * n;
@@ -1814,12 +2005,8 @@ function renderFold(fs, gwA, gwB) {
 
   buildLattice(n, w);
 
-  geoA.bold = new Path2D(); geoA.mid = new Path2D(); geoA.fine = new Path2D();
-  buildGeometry(motifA, geoA, n, stamps, clock, w * gwA);
-  if (gwB > 0.002) {
-    geoB.bold = new Path2D(); geoB.mid = new Path2D(); geoB.fine = new Path2D();
-    buildGeometry(motifB, geoB, n, stamps, clock, w * gwB);
-  }
+  const geoA = geoSlot(fi * 2, motifA, n, stamps, w * gwA);
+  const geoB = gwB > 0.002 ? geoSlot(fi * 2 + 1, motifB, n, stamps, w * gwB) : null;
 
   ctx.globalCompositeOperation = 'lighter';
 
@@ -1827,18 +2014,19 @@ function renderFold(fs, gwA, gwB) {
   for (let k = 2; k >= 0; k--) if (lkBins[3 + k])
     drawLayer(ctx, pFine[k], gradMain[2], T.fineWidth * widthScale, T.fineAlpha * L * fineScale * BK[k] * w, baseM, oxM, oyM, n, rot);
   if (geoA.hasFine) drawLayer(ctx, geoA.fine, gradMain[4], T.geoFineWidth * widthScale, T.geoFineAlpha * L * fineScale * w * gwA, baseM, oxM, oyM, n, grot);
-  if (gwB > 0.002 && geoB.hasFine) drawLayer(ctx, geoB.fine, gradMain[4], T.geoFineWidth * widthScale, T.geoFineAlpha * L * fineScale * w * gwB, baseM, oxM, oyM, n, grot);
+  if (geoB && geoB.hasFine) drawLayer(ctx, geoB.fine, gradMain[4], T.geoFineWidth * widthScale, T.geoFineAlpha * L * fineScale * w * gwB, baseM, oxM, oyM, n, grot);
 
   // secondary: the lattice and the subdivided geometry
   for (let k = 2; k >= 0; k--) if (lkBins[k])
     drawLayer(ctx, pMid[k], gradMain[1], T.midWidth * widthScale, T.midAlpha * L * midScale * BK[k] * w, baseM, oxM, oyM, n, rot);
   drawLayer(ctx, geoA.mid, gradMain[3], T.geoMidWidth * widthScale, T.geoMidAlpha * L * w * gwA, baseM, oxM, oyM, n, grot);
-  if (gwB > 0.002) drawLayer(ctx, geoB.mid, gradMain[3], T.geoMidWidth * widthScale, T.geoMidAlpha * L * w * gwB, baseM, oxM, oyM, n, grot);
+  if (geoB) drawLayer(ctx, geoB.mid, gradMain[3], T.geoMidWidth * widthScale, T.geoMidAlpha * L * w * gwB, baseM, oxM, oyM, n, grot);
 
   // primary: a few bold strokes, never shed
   drawLayer(ctx, geoA.bold, gradMain[0], T.boldWidth * widthScale, T.boldAlpha * L * w * gwA, baseM, oxM, oyM, n, grot);
-  if (gwB > 0.002) drawLayer(ctx, geoB.bold, gradMain[0], T.boldWidth * widthScale, T.boldAlpha * L * w * gwB, baseM, oxM, oyM, n, grot);
+  if (geoB) drawLayer(ctx, geoB.bold, gradMain[0], T.boldWidth * widthScale, T.boldAlpha * L * w * gwB, baseM, oxM, oyM, n, grot);
   drawLayer(ctx, pDot, gradMain[5], T.dotWidth * widthScale, T.dotAlpha * L * w, baseM, oxM, oyM, n, rot);
+  if (streakN) drawLayer(ctx, pStreak, gradMain[0], T.streakWidth * widthScale, T.streakAlpha * L * w, baseM, oxM, oyM, n, rot);
 
   // bright pass -> bloom buffer
   bActx.globalCompositeOperation = 'lighter';
@@ -1846,11 +2034,12 @@ function renderFold(fs, gwA, gwB) {
   if (lkBins[1]) drawLayer(bActx, pMid[1], gradBloom[1], T.midWidth * widthScale, T.midAlpha * L * midScale * w * bb * 0.7 * BK[1], baseB, oxB, oyB, n, rot);
   drawLayer(bActx, geoA.mid, gradBloom[3], T.geoMidWidth * widthScale, T.geoMidAlpha * L * w * gwA * bb, baseB, oxB, oyB, n, grot);
   drawLayer(bActx, geoA.bold, gradBloom[0], T.boldWidth * widthScale, T.boldAlpha * L * w * gwA * bb, baseB, oxB, oyB, n, grot);
-  if (gwB > 0.002) {
+  if (geoB) {
     drawLayer(bActx, geoB.mid, gradBloom[3], T.geoMidWidth * widthScale, T.geoMidAlpha * L * w * gwB * bb, baseB, oxB, oyB, n, grot);
     drawLayer(bActx, geoB.bold, gradBloom[0], T.boldWidth * widthScale, T.boldAlpha * L * w * gwB * bb, baseB, oxB, oyB, n, grot);
   }
   drawLayer(bActx, pDot, gradBloom[5], T.dotWidth * widthScale, T.dotAlpha * L * w * bb, baseB, oxB, oyB, n, rot);
+  if (streakN) drawLayer(bActx, pStreak, gradBloom[0], T.streakWidth * widthScale, T.streakAlpha * L * w * bb, baseB, oxB, oyB, n, rot);
 }
 
 function frame(now) {
@@ -1863,6 +2052,7 @@ function frame(now) {
   if (dtMs > CONFIG.core.dtClampMs) dtMs = CONFIG.core.dtClampMs;
   const dt = dtMs / 1000;
   clock += dt;
+  frameNo++;
   frameAvgMs += (dtMs - frameAvgMs) * CONFIG.perf.smoothing;
 
   resize();
@@ -1891,12 +2081,15 @@ function frame(now) {
   const rs = Math.sin(rotPhase);
   rotSpeed = Math.sign(rs) * Math.pow(Math.abs(rs), CONFIG.trance.rotShape) *
              CONFIG.trance.rotDegPerSecMax * (Math.PI / 180) * rmRotation;
-  rotAngle += rotSpeed * dt;
+  rotAngle += (rotSpeed + touchRotBias) * dt;
   if (rotAngle > TAU) rotAngle -= TAU; else if (rotAngle < 0) rotAngle += TAU;
   geoPhase += dt * motifA.phaseRate * rmRotation;
   bgDriftAng += dt * 0.006;
 
-  SC = arc.v.expand * (1 + CONFIG.trance.breathScale * breath * rmBreath);
+  // Pinch rides on top of the arc's scale, hard-clamped so the field always
+  // covers the corners however the user pulls at it.
+  SC = clamp(arc.v.expand * (1 + CONFIG.trance.breathScale * breath * rmBreath) * (1 + touchScaleBias),
+             0.92, 1.24);
   widthScale = slew(widthScale, arc.v.width, CONFIG.safety.widthRatePerSec, dt);
 
   // Every path that can move large-area luminance funnels through slew().
@@ -1910,6 +2103,7 @@ function frame(now) {
 
   densityTotal = clamp(arc.v.density * quality * inkScale, 0.05, 1.15);
 
+  updateRings();
   updateFlow(dt, arc.v.tempo);
   churnNodes();
   recycleNodes(dt);
@@ -1935,7 +2129,7 @@ function frame(now) {
   if (motifBlend < 1) { const s = smootherstep(motifBlend); gwA = 1 - s; gwB = s; }
 
   inkAccum = 0;
-  for (let f = 0; f < foldCount; f++) renderFold(FOLDSETS[f], gwA, gwB);
+  for (let f = 0; f < foldCount; f++) renderFold(FOLDSETS[f], gwA, gwB, f);
 
   const bs = CONFIG.bloom.bufferScale;
   drawAnchor(ctx, DPR * SC, DPR * cxCss, DPR * cyCss,
